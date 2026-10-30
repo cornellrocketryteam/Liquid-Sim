@@ -9,7 +9,7 @@
 % Ullages: N2 control volume: N2 enthalpy in, heat to the liquid out
 % Ethanol: liquid lumped temp (CoolProp)
 % Nitrous: subcooled liquid lumped temp (CoolProp). Liquid evaporates into the growing ullage (ullage stays saturated) and cools itself
-% Injector: Nitrous(Dyer, CdA set at the design point), ethanol (incompressible orifice), Film cooling ethanol shares the ethanol manifold but bypasses the pintle impingement
+% Injector: Nitrous(Dyer, CdA set at the design point), ethanol (incompressible orifice)
 % Chamber: Pc = mdot*c*/At with c* fixed at the design point
 % Nozzle: isentropic Cf at fixed gamma 
 
@@ -46,12 +46,25 @@ a_kp_ox = 300*s;
 theta_crack = 27; % preburn feedforward while pressurizing [deg]
 
 % theta_FF(P) = theta_0 + b_ff/P [deg], P = COPV PT [psig]
-% Fit points derived from the COPV starting state (see "E-REG feedforward fit points"):
-% pressures span P_copv_0 down to the lowest COPV pressure that keeps both valves choked, temps follow the isentropic blowdown
+% Fit points derived from the COPV starting state (E-REG feedforward fit"):
+% pressures are P_copv_0 (max) to the lowest COPV pressure that keeps
+% choked flow. Temps are isentropic
 n_fit = 8; % number of COPV pressures to fit the feedforward over
 
 T_ull_fit_K = 270; % ullage gas temp during burn [K]
-t_press_max = 30; % stop if the tanks haven't reached P_set by this time [s]
+t_press_max = 30; % stop if the tanks havent reached P_set by this time [s]
+
+
+% PT Noise: reading = true +  offset + noise
+ptNoiseOn = true;
+PT_seed = 1; % RNG seed so runs are repeatable
+PT_FS_copv_psi = 5000; % COPV PT max pressures[psi]
+PT_FS_tank_psi = 1500; % tank PT max pressures [psi]
+PT_noise_FS = 0.0025; % 1-sigma noise; fraction of pt range
+PT_bias_FS = 0.0025; % 1-sigma zero offset; fraction of pt range
+PT_bits = 16; % ADC resolution
+f_lpf = Inf; % low-pass filter simulation (Inf = no filter)
+
 
 % Feed lines
 dP_COPVtoEth_psi = 50; % COPV -> ethanol tank line loss [psig]
@@ -376,7 +389,7 @@ for k = 1:n
             armed = all(~isnan([tk.t_reach])); % both tanks at trigger
 
             % Feedforward switches to burn mode at t_ereg (burn start + t_ereg_offset) and ramps over t_mav:
-            % N2 demand follows liquid outflow, so the burn feedforward's Cv follows the MAV opening profile, shifted by the offset
+            % N2 flow follows liquid outflow. Burn feedforward's Cv follows the linear MAV opening, shifted by the offset
             if eregBurn
                 f_ff = min((t - t_ereg)/max(t_mav, eps), 1); % feedforward ramp fraction (MAV opening profile, shifted)
                 th_burn = min(max(theta_0(i) + b_ff(i)/P_copv_meas, 0), 90); % full-burn feedforward angle [deg]
@@ -463,7 +476,7 @@ for k = 1:n
         TMR = (tk(2).mdot*v_pin)/(mdot_ann*v_ann); % total momentum ratio
 
         % Chamber: quasi-steady Pc = mdot*c*/At, approached with the L* fill lag (backward Euler)
-        Pc_now = Pc; % Pc the flows above were solved against
+        Pc_now = Pc;
         Pc_qs = max((tk(1).mdot + tk(2).mdot)*cstar_des/At, P_atm);
         Pc = Pc + (Pc_qs - Pc)*dt/(tau_c + dt);
         F = thrustFun(Pc_now);
@@ -537,8 +550,8 @@ for k = 1:n
         tk(i).U_N2 = tk(i).U_N2 - Q*dt - tk(i).P_N2*dV + tk(i).mdot_N2*h_copv*dt;
         tk(i).m_N2 = tk(i).m_N2 + tk(i).mdot_N2*dt;
 
-        % Propellant vapor kept at saturation at the liquid temp (instant evaporation) latent heat comes out of the liquid.
-        % Linearized-implicit in T_liq (explicit is unstable once the ullage is large)
+        % Propellant vapor kept at saturation at the liquid temp ( via instant evaporation) latent heat comes out of the liquid
+        % Linearized implicit in T_liq (explicit is unstable if the ullage is large) (math in CDR)
         T_l = tk(i).T_liq;
         a = interpSat(sat{i}, 3, T_l)*V_ull_new - tk(i).m_vap; % vapor needed at the current temp [kg]
         b = (interpSat(sat{i}, 3, T_l + 0.25) - interpSat(sat{i}, 3, T_l - 0.25))/0.5*V_ull_new; % d(vapor needed)/dT [kg/K]
