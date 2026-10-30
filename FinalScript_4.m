@@ -57,13 +57,13 @@ t_press_max = 30; % stop if the tanks havent reached P_set by this time [s]
 
 % PT Noise: reading = true +  offset + noise
 ptNoiseOn = true;
-PT_seed = 1; % RNG seed so runs are repeatable
-PT_FS_copv_psi = 5000; % COPV PT max pressures[psi]
-PT_FS_tank_psi = 1500; % tank PT max pressures [psi]
-PT_noise_FS = 0.0025; % 1-sigma noise; fraction of pt range
-PT_bias_FS = 0.0025; % 1-sigma zero offset; fraction of pt range
-PT_bits = 16; % ADC resolution
-f_lpf = Inf; % low-pass filter simulation (Inf = no filter)
+PT_seed = 1; % Seed
+PT_rating_copv_psi = 5000; % COPV PT range [psi]
+PT_rating_tank_psi = 1500; % tank PT range[psi]
+PT_TEB = 0.01; % datasheet total error band: ±1% of span from -20 to 85 C
+PT_noise = 0.0025; % 1-sigma noise (temporary gotta review data)
+PT_bits = 12; % ADC resolution
+f_lpf = Inf; % Inf = no filter [hz]
 
 
 % Feed lines
@@ -332,6 +332,14 @@ end
 % Chamber
 Pc = P_atm; % [Pa abs]
 
+
+% Pressure transducers: 1 = COPV, 2 = eth tank, 3 = nitrous tank
+rng(PT_seed);
+PT_ratings = [PT_rating_copv_psi, PT_rating_tank_psi, PT_rating_tank_psi]; % [psi]
+PT_sigma = PT_noise*PT_ratings; % white noise 1-sigma [psi]
+a_lpf = dt/(1/(2*pi*f_lpf) + dt); % low-pass weight per sample
+P_meas = [psig(P_copv), psig(tk(1).P), psig(tk(2).P)]; % filtered PT readings [psig]
+
 %% Solver
 n = round(t_max/dt);
 [t_log, P_copv_log, T_copv_log, m_copv_log, Pc_log, F_log, OF_log, OFimp_log, TMR_log] = deal(nan(n,1));
@@ -339,6 +347,7 @@ n = round(t_max/dt);
 [mdot_N2_log, r_log, P_vout_log, theta_log, thetaCmd_log, thetaFF_log, e_log, Kp_log, Cv_log, ...
     P_tank_log, Pv_log, T_ull_log, T_liq_log, m_N2_log, m_vap_log, m_liq_log, V_ull_log, ...
     mdot_liq_log, P_injIn_log, dP_inj_log] = deal(nan(n,2));
+P_meas_log = nan(n,3); % filtered PT readings [psig]: COPV, ethanol, nitrous
 
 stopReason = 'reached t_max';
 t_burn = NaN; % time the burn starts
@@ -349,9 +358,20 @@ t_ereg = NaN; % time the E-REG switches to burn mode (burn start + t_ereg_offset
 for k = 1:n
     t = (k-1)*dt;
 
+    % PTs
+    P_true = [psig(P_copv), psig(tk(1).P), psig(tk(2).P)]; % [psig]
+    if ptNoiseOn
+        for j = 1:3
+            % low pass filtering
+            P_meas(j) = P_meas(j) + a_lpf*(ptRead(P_true(j), PT_ratings(j), PT_sigma(j), PT_bits) - P_meas(j));
+        end
+    else
+        P_meas = P_true;
+    end
+
     % tank is within the trigger pressure (setpoint + offset) for first time
     for i = 1:2
-        if isnan(tk(i).t_reach) && tk(i).P >= P_trig(i) - psi2Pa(1)
+        if isnan(tk(i).t_reach) && P_meas(i+1) >= psig(P_trig(i)) - 1
             tk(i).t_reach = t;
         end
     end
@@ -375,7 +395,7 @@ for k = 1:n
 
     % E-REG controllers: run every 1/f_ctrl on the PT readings
     if mod(k-1, N_ctrl) == 0
-        P_copv_meas = max(psig(P_copv), 1); 
+        P_copv_meas = max(P_meas(1), 1);
         for i = 1:2
             if burning
                 P_target = P_set(i); 
@@ -383,7 +403,7 @@ for k = 1:n
                 P_target = P_pre(i); 
             end 
 
-            tk(i).e = psig(P_target) - psig(tk(i).P); % pressure error [psi]
+            tk(i).e = psig(P_target) - P_meas(i+1); % pressure error [psi]
             tk(i).Kp = kp_0(i) + a_kp(i)/P_copv_meas; % [deg/psi]
 
             armed = all(~isnan([tk.t_reach])); % both tanks at trigger
@@ -494,6 +514,7 @@ for k = 1:n
 
     % Log
     t_log(k) = t;
+    P_meas_log(k,:) = P_meas;
     P_copv_log(k) = P_copv; T_copv_log(k) = T_copv; m_copv_log(k) = m_copv;
     Pc_log(k) = Pc_now; F_log(k) = F; OF_log(k) = tk(2).mdot/tk(1).mdot;
     OFimp_log(k) = tk(2).mdot/(tk(1).mdot*mdot_annulus/mdot_eth_des); TMR_log(k) = TMR;
@@ -587,6 +608,8 @@ F_log = F_log(idx);
 OF_log = OF_log(idx);
 OFimp_log = OFimp_log(idx);
 TMR_log = TMR_log(idx);
+P_meas_log = P_meas_log(idx,:);
+
 
 mdot_N2_log = mdot_N2_log(idx,:);
 r_log = r_log(idx,:);
@@ -636,6 +659,9 @@ P_copv_chokeMin = (P_set + dP_line)/r_crit; % r_crit at the final COPV state
 %% Results
 fprintf('=== Setup ===\n');
 if eregOn, eregStr = 'ON (regulating through the burn)'; else, eregStr = 'OFF (shut at burn trigger, blowdown burn)'; end
+if ptNoiseOn
+    fprintf('PTs: %.2f%% FS noise (1-sigma), %d-bit ADC, %g Hz low-pass\n', 100*PT_noise, PT_bits, f_lpf);
+end
 fprintf('E-REG %s: %g Hz, %g ms delay, %g deg/s servo\n', eregStr, f_ctrl, t_delay*1e3, servo_rate);
 for i = 1:2
     fprintf('  %-7s Kp = %g + %g/P | theta_FF = %.2f + %.0f/P (%g deg while pressurizing) | limits %g-%g deg | N2 line loss %g psi\n', legName{i}, ...
@@ -758,6 +784,7 @@ cLeg = {c2, c5}; % ethanol, nitrous
 figure('Name','COPV & N2 supply','Position',[50 60 900 900]);
 tl = tiledlayout(4,1,'TileSpacing','compact'); title(tl, 'COPV & N2 Supply');
 ax1(1) = nexttile; hold on;
+plot(t_log, P_meas_log(:,1), 'Color', [c1 0.35], 'LineWidth', 0.5);
 plot(t_log, psig(P_copv_log), 'Color', c1, 'LineWidth', 1.5);
 yline(psig(max(P_copv_chokeMin)), ':', 'Min for choked flow', 'Color', [0.4 0.4 0.4]);
 ylabel('COPV pressure [psig]');
@@ -857,11 +884,14 @@ figure('Name','E-REG controllers','Position',[300 60 1400 900]);
 tl = tiledlayout(4,2,'TileSpacing','compact','TileIndexing','columnmajor'); title(tl, 'E-REG Controllers');
 ax6 = gobjects(0);
 for i = 1:2
-    ax6(end+1) = nexttile; hold on;
+    ax6(end+1) = nexttile; 
+    hold on;
+    plot(t_log, P_meas_log(:,i+1), 'Color', [cLeg{i} 0.35], 'LineWidth', 0.5);
     plot(t_log, psig(P_tank_log(:,i)), 'Color', cLeg{i}, 'LineWidth', 1.5);
     yline(psig(P_set(i)), '--', 'Setpoint', 'Color', 'w');
     if dP_trig(i) ~= 0, yline(psig(P_trig(i)), ':', 'Burn trigger', 'Color', c3); end
     ylabel([legName{i} ' PT [psig]']); title(legName{i});
+    legend('PT reading','True','Location','best')
     ax6(end+1) = nexttile;
     plot(t_log, e_log(:,i), 'Color', c4, 'LineWidth', 1.5); ylabel('Error e [psi]');
     ax6(end+1) = nexttile; hold on;
@@ -946,4 +976,12 @@ function G = oxFlux(P1, P2, T1, rho1, Pv, r_hem, NOX)
     G_hem = rho2*sqrt(2*max(h1 - h2, 0));
     k = sqrt(dP/(Pv - P2));
     G = (k*G_spi + G_hem)/(1 + k);
+end
+
+
+% PT reading [psig]: true + noise
+function y = ptRead(P_true, range, sigma, bits)
+    q = range/(2^bits); % ADC step [psi]
+    y = P_true + sigma*randn;
+    y = min(max(round(y/q)*q, 0), range);
 end
